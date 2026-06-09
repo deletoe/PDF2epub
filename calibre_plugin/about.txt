@@ -1,0 +1,9 @@
+Local PDF OCR converts scanned PDFs to reflowable EPUBs with a local OpenAI-compatible vision model.
+
+The plugin is designed for local endpoints such as vLLM or LM Studio that expose /v1/models and /v1/chat/completions. It renders each PDF page, sends page images to the configured model, streams recent OCR output into the progress dialog, and writes a standard EPUB back into the Calibre library.
+
+Current workflow:
+- Select one book with a PDF format.
+- Click Local PDF OCR.
+- Use Cancel to request interruption.
+- Configure endpoint, model, page parallelism, timeouts, recent-output buffer size, cover detection, and illustration extraction from Calibre's plugin customization dialog.
