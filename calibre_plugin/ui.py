@@ -335,6 +335,13 @@ class PdfOcrWorker(QThread):
                 retry_callback=self.request_retry_decision,
             )
             self.log.emit("TOC planned with {0} item(s).".format(len(toc_plan.get("items") or [])))
+            if toc_plan.get("chunk_count"):
+                self.log.emit(
+                    "TOC planning used {0} candidate(s) in {1} chunk(s).".format(
+                        toc_plan.get("candidate_count") or "?",
+                        toc_plan.get("chunk_count") or "?",
+                    )
+                )
             if toc_plan.get("fallback"):
                 self.log.emit("TOC planning used fallback rules after LLM failure: {0}".format(toc_plan.get("fallback_reason") or ""))
 
