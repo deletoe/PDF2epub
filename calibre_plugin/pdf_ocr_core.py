@@ -846,7 +846,7 @@ def fallback_toc_plan(candidates, reason):
     return {"items": items, "fallback": True, "fallback_reason": str(reason or "")[:1000]}
 
 
-def plan_toc(page_results, settings, cancel_callback=None, retry_callback=None):
+def plan_toc_single_request(page_results, settings, cancel_callback=None, retry_callback=None):
     candidates = filtered_toc_candidates(collect_toc_candidates(page_results))
     if not candidates:
         return {"items": []}
@@ -907,6 +907,128 @@ def plan_toc(page_results, settings, cancel_callback=None, retry_callback=None):
             }
         )
     return {"items": items, "raw": data, "usage": result.get("usage") or {}}
+
+
+def toc_candidate_chunks(candidates, chunk_size=120):
+    chunk_size = max(1, int(chunk_size or 120))
+    return [candidates[index : index + chunk_size] for index in range(0, len(candidates), chunk_size)]
+
+
+def parse_toc_items(data, candidates):
+    items = []
+    candidate_keys = {(item["page"], item["block_index"]) for item in candidates}
+    for item in data.get("items") or []:
+        try:
+            page = int(item.get("page") or 0)
+            block_index = int(item.get("block_index"))
+            level = max(1, min(4, int(item.get("level") or 1)))
+        except Exception:
+            continue
+        if (page, block_index) not in candidate_keys:
+            continue
+        label = cleanup_ocr_text(item.get("label") or "")
+        if not label:
+            continue
+        items.append(
+            {
+                "page": page,
+                "block_index": block_index,
+                "label": label,
+                "level": level,
+                "reason": str(item.get("reason") or ""),
+            }
+        )
+    return items
+
+
+def plan_toc_chunk(client, candidates, settings, chunk_index, chunk_count, cancel_callback=None, retry_callback=None):
+    prompt = TOC_PROMPT
+    if chunk_count > 1:
+        prompt += "\n\n这是标题候选分块 {0}/{1}。只从本分块候选中选择目录项；不要补写其他分块的标题。".format(
+            chunk_index,
+            chunk_count,
+        )
+    prompt += "\n\n标题候选：\n" + json.dumps(
+        compact_toc_candidates(candidates),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    attempt = 1
+    while True:
+        if cancel_callback and cancel_callback():
+            raise RuntimeError("Canceled by user")
+        try:
+            result = client.text_chat(
+                prompt,
+                max_tokens=int(settings.get("toc_max_tokens", 65536)),
+                temperature=0,
+                stream_callback=lambda delta: None,
+                cancel_callback=cancel_callback,
+            )
+            data = parse_json_object(result.get("text") or "")
+            return {
+                "items": parse_toc_items(data, candidates),
+                "raw": data,
+                "usage": result.get("usage") or {},
+                "fallback": False,
+            }
+        except Exception as exc:
+            if cancel_callback and cancel_callback():
+                raise RuntimeError("Canceled by user")
+            if attempt >= 3 and retry_callback is None:
+                return fallback_toc_plan(candidates, exc)
+            if retry_callback is None:
+                raise
+            decision_page = -2 if attempt >= 3 else -1
+            decision = retry_callback(decision_page, attempt, str(exc))
+            if decision == "fallback":
+                return fallback_toc_plan(candidates, exc)
+            if decision == "abandon":
+                raise RuntimeError("Abandoned by user")
+            attempt += 1
+
+
+def plan_toc(page_results, settings, cancel_callback=None, retry_callback=None):
+    candidates = filtered_toc_candidates(collect_toc_candidates(page_results))
+    if not candidates:
+        return {"items": []}
+    client = LocalLlmClient(
+        settings.get("base_url"),
+        model=settings.get("model"),
+        timeout=max(1800, int(settings.get("request_timeout", 180))),
+    )
+    chunks = toc_candidate_chunks(candidates, int(settings.get("toc_chunk_size", 120) or 120))
+    merged_items = []
+    seen = set()
+    raw_chunks = []
+    fallback_reasons = []
+    for index, chunk in enumerate(chunks, 1):
+        chunk_plan = plan_toc_chunk(
+            client,
+            chunk,
+            settings,
+            index,
+            len(chunks),
+            cancel_callback=cancel_callback,
+            retry_callback=retry_callback,
+        )
+        raw_chunks.append(chunk_plan.get("raw") or {})
+        if chunk_plan.get("fallback"):
+            fallback_reasons.append(chunk_plan.get("fallback_reason") or "")
+        for item in chunk_plan.get("items") or []:
+            key = (int(item.get("page") or 0), int(item.get("block_index") or 0))
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_items.append(item)
+    return {
+        "items": merged_items,
+        "raw_chunks": raw_chunks,
+        "candidate_count": len(candidates),
+        "chunk_count": len(chunks),
+        "fallback": bool(fallback_reasons),
+        "fallback_reason": "\n".join(reason for reason in fallback_reasons if reason)[:1000],
+    }
 
 
 def normalize_page_result(page_number, image_path, response_text, usage=None, seconds=None, settings=None, raw_response=None):
