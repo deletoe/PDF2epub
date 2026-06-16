@@ -13,8 +13,10 @@ DEFAULT_PREFS = {
     "auto_retry_attempts": 3,
     "max_tokens_per_page": 65536,
     "toc_max_tokens": 65536,
+    "toc_chunk_size": 60,
     "recent_page_buffer": 6,
     "cover_scan_pages": 5,
+    "cover_multi_image": True,
     "detect_cover": True,
     "detect_illustrations": True,
     "warn_text_pdf": True,
@@ -84,6 +86,12 @@ class ConfigWidget(QWidget):
         self.toc_max_tokens.setValue(int(values["toc_max_tokens"]))
         form.addRow("TOC max tokens", self.toc_max_tokens)
 
+        self.toc_chunk_size = QSpinBox()
+        self.toc_chunk_size.setRange(10, 500)
+        self.toc_chunk_size.setSingleStep(10)
+        self.toc_chunk_size.setValue(int(values["toc_chunk_size"]))
+        form.addRow("TOC candidate chunk size", self.toc_chunk_size)
+
         self.recent_page_buffer = QSpinBox()
         self.recent_page_buffer.setRange(1, 50)
         self.recent_page_buffer.setValue(int(values["recent_page_buffer"]))
@@ -127,6 +135,7 @@ class ConfigWidget(QWidget):
         prefs["auto_retry_attempts"] = int(self.auto_retry_attempts.value())
         prefs["max_tokens_per_page"] = int(self.max_tokens_per_page.value())
         prefs["toc_max_tokens"] = int(self.toc_max_tokens.value())
+        prefs["toc_chunk_size"] = int(self.toc_chunk_size.value())
         prefs["recent_page_buffer"] = int(self.recent_page_buffer.value())
         prefs["detect_cover"] = self.detect_cover.isChecked()
         prefs["cover_scan_pages"] = int(self.cover_scan_pages.value())

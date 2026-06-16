@@ -1,7 +1,6 @@
 from __future__ import absolute_import, division, print_function, unicode_literals
 
 import json
-import queue
 import re
 import shutil
 import subprocess
@@ -15,15 +14,23 @@ from pathlib import Path
 from calibre_plugins.local_pdf_ocr.local_llm import LocalLlmClient
 
 
+class InvalidJsonResponseError(RuntimeError):
+    def __init__(self, message, response_text="", raw_response=None):
+        RuntimeError.__init__(self, message)
+        self.response_text = response_text or ""
+        self.raw_response = raw_response or {}
+
+
 PAGE_PROMPT = """请把这页中文扫描书页转写为可重排电子书文本，并返回严格 JSON。
 
 要求：
 1. 只输出页面中真实可见的文字，不要补写下一页或推测缺失内容。
+1a. 如果页末是未完句、跨页断词或未完引文，按原页可见文字停住；不要为了句子完整而补标点、补字或补闭引号。
 2. 去掉页码、装饰线、页眉、页脚。页眉通常是每页顶部反复出现的书名/章节名/栏目名，例如“阿莱克修斯传”等；除非它也是本页正文中的真实标题，否则不要放入正文。
 3. 合并同一自然段内的换行；对话另起段。
 4. 使用中文标点。不要改写原文。
 5. 不要在中文、数字、英文、标点之间额外添加空格；标题里的装饰性字间距要还原，例如“译 者 序”应输出为“译者序”，“1131 年”应输出为“1131年”。
-6. 标题、次级标题、正文段落、引文、角注/脚注必须在 blocks 中标注。text 字段可以是同样内容的 Markdown 预览文本。
+6. text 字段必须包含本页完整可重排正文，标题用 Markdown #/##/### 标出。blocks 字段只标注标题、引文、带注释锚点的段落、跨页续接的首段等结构信息；普通正文段落不要在 blocks 中重复一遍。
 7. 如果本页第一段不是新段落，而是承接上一页最后一段，请把 page_continues_previous 设为 true，并把第一个正文 paragraph block 的 continued_from_previous 设为 true。
 8. 如果页面边角或页边有角注、脚注、校注、译注等，不要混进正文；放入 notes，并在相关 block 中用 note_markers 标出锚点。无法确定锚点时 anchor 留空。
 9. 如果页面包含插图、照片、地图、表格、手稿图等非纯装饰图片，在 illustrations 中给出裁切范围。
@@ -61,10 +68,9 @@ SIMPLIFIED_OUTPUT_PROMPT = """\n\n额外语言要求：
 """
 
 
-COMPACT_PAGE_JSON_PROMPT = """\n\n重试输出要求：
-上一轮输出不是合法 JSON。请改用更紧凑的 JSON：
+COMPACT_PAGE_JSON_PROMPT = """\n\n紧凑 JSON 输出要求：
 1. text 仍然输出本页完整可重排正文。
-2. 普通正文段落不要再逐段复制到 blocks；blocks 只保留 heading、quote、带 note_markers 的 paragraph、或 continued_from_previous=true 的首段。
+2. 普通正文段落不要逐段复制到 blocks；blocks 只保留 heading、quote、带 note_markers 的 paragraph、或 continued_from_previous=true 的首段。
 3. 如果没有这些特殊结构，blocks 可以为空数组，后续流程会从 text 自动拆段。
 4. notes 和 illustrations 仍按原 schema 输出；没有则为空数组。
 5. 只输出一个完整 JSON 对象，不要 Markdown 代码块，不要解释。
@@ -75,7 +81,7 @@ def build_page_prompt(settings):
     prompt = PAGE_PROMPT
     if settings and settings.get("convert_traditional_to_simplified", False):
         prompt += SIMPLIFIED_OUTPUT_PROMPT
-    if settings and settings.get("_compact_page_json"):
+    if not settings or not settings.get("_disable_compact_page_json"):
         prompt += COMPACT_PAGE_JSON_PROMPT
     return prompt
 
@@ -324,6 +330,46 @@ def render_pdf_pages(pdf_path, out_dir, dpi=220, progress=None, cancel_callback=
     )
 
 
+def start_throttled_output_reader(stream, prefix="", report_every=1000):
+    state = {"last_message": "", "line_count": 0, "suppressed": 0, "report": ""}
+    lock = threading.Lock()
+
+    def read_output():
+        if not stream:
+            return
+        for output_line in stream:
+            message = str(output_line or "").strip()
+            if not message:
+                continue
+            with lock:
+                state["last_message"] = message
+                state["line_count"] += 1
+                state["suppressed"] += 1
+                if state["suppressed"] >= report_every:
+                    state["report"] = "{0}{1} renderer warning line(s) suppressed; latest: {2}".format(
+                        prefix,
+                        state["line_count"],
+                        message[:180],
+                    )
+                    state["suppressed"] = 0
+
+    reader = threading.Thread(target=read_output)
+    reader.daemon = True
+    reader.start()
+
+    def consume_report():
+        with lock:
+            report = state.get("report") or ""
+            state["report"] = ""
+            return report
+
+    def last_message():
+        with lock:
+            return state.get("last_message") or ""
+
+    return consume_report, last_message
+
+
 def render_pdf_pages_with_pdftoppm(pdf_path, out_dir, command, dpi=220, progress=None, cancel_callback=None):
     out_dir = Path(out_dir)
     render_dir = out_dir / "pdftoppm_pages"
@@ -341,19 +387,8 @@ def render_pdf_pages_with_pdftoppm(pdf_path, out_dir, command, dpi=220, progress
         stderr=subprocess.STDOUT,
         universal_newlines=True,
     )
-    last_message = ""
-    output_queue = queue.Queue()
     last_rendered = -1
-
-    def read_output():
-        if not process.stdout:
-            return
-        for output_line in process.stdout:
-            output_queue.put(output_line)
-
-    reader = threading.Thread(target=read_output)
-    reader.daemon = True
-    reader.start()
+    consume_report, last_message = start_throttled_output_reader(process.stdout, "Calibre pdftoppm: ")
     while True:
         if cancel_callback and cancel_callback():
             try:
@@ -365,14 +400,10 @@ def render_pdf_pages_with_pdftoppm(pdf_path, out_dir, command, dpi=220, progress
                 except Exception:
                     pass
             raise RuntimeError("Canceled by user")
-        try:
-            line = output_queue.get(timeout=0.2)
-            last_message = line.strip()
-            if progress and last_message:
-                progress(max(0, last_rendered), page_count or 1, "Calibre pdftoppm: {0}".format(last_message))
-            continue
-        except queue.Empty:
-            pass
+        time.sleep(0.2)
+        report = consume_report()
+        if progress and report:
+            progress(max(0, last_rendered), page_count or 1, report)
         rendered_count = len(list(render_dir.glob("page-*.jpg")))
         if rendered_count != last_rendered and rendered_count > 0:
             last_rendered = rendered_count
@@ -384,7 +415,7 @@ def render_pdf_pages_with_pdftoppm(pdf_path, out_dir, command, dpi=220, progress
         if process.poll() is not None:
             break
     if process.returncode:
-        raise RuntimeError("Calibre pdftoppm failed while rendering PDF pages.\n{0}".format(last_message))
+        raise RuntimeError("Calibre pdftoppm failed while rendering PDF pages.\n{0}".format(last_message()))
 
     images = sorted(render_dir.glob("page-*.jpg"), key=natural_key)
     if not images:
@@ -418,18 +449,7 @@ def render_pdf_pages_with_ebook_convert(pdf_path, out_dir, dpi=220, progress=Non
         stderr=subprocess.STDOUT,
         universal_newlines=True,
     )
-    last_message = ""
-    output_queue = queue.Queue()
-
-    def read_output():
-        if not process.stdout:
-            return
-        for output_line in process.stdout:
-            output_queue.put(output_line)
-
-    reader = threading.Thread(target=read_output)
-    reader.daemon = True
-    reader.start()
+    consume_report, last_message = start_throttled_output_reader(process.stdout, "Calibre PDF renderer: ")
     while True:
         if cancel_callback and cancel_callback():
             try:
@@ -441,26 +461,14 @@ def render_pdf_pages_with_ebook_convert(pdf_path, out_dir, dpi=220, progress=Non
                 except Exception:
                     pass
             raise RuntimeError("Canceled by user")
-        try:
-            line = output_queue.get(timeout=0.2)
-            last_message = line.strip()
-            if progress and last_message:
-                progress(0, 1, "Calibre PDF renderer: {0}".format(last_message))
-            continue
-        except queue.Empty:
-            pass
+        time.sleep(0.2)
+        report = consume_report()
+        if progress and report:
+            progress(0, 1, report)
         if process.poll() is not None:
-            while True:
-                try:
-                    line = output_queue.get_nowait()
-                except queue.Empty:
-                    break
-                last_message = line.strip()
-                if progress and last_message:
-                    progress(0, 1, "Calibre PDF renderer: {0}".format(last_message))
             break
     if process.returncode:
-        raise RuntimeError("Calibre ebook-convert failed while rendering PDF pages.\n{0}".format(last_message))
+        raise RuntimeError("Calibre ebook-convert failed while rendering PDF pages.\n{0}".format(last_message()))
 
     candidates = []
     for pattern in ("*.jpg", "*.jpeg", "*.png"):
@@ -522,6 +530,57 @@ def repair_json_object_text(text):
     return text
 
 
+def extract_json_string_value(text, key):
+    text = str(text or "")
+    match = re.search(r'"{0}"\s*:'.format(re.escape(key)), text)
+    if not match:
+        return ""
+    index = match.end()
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text) or text[index] != '"':
+        return ""
+    index += 1
+    chars = []
+    while index < len(text):
+        char = text[index]
+        if char == '"':
+            return "".join(chars)
+        if char == "\\" and index + 1 < len(text):
+            index += 1
+            escaped = text[index]
+            if escaped == "n":
+                chars.append("\n")
+            elif escaped == "r":
+                chars.append("\r")
+            elif escaped == "t":
+                chars.append("\t")
+            elif escaped == "b":
+                chars.append("\b")
+            elif escaped == "f":
+                chars.append("\f")
+            elif escaped == "u" and index + 4 < len(text):
+                code = text[index + 1 : index + 5]
+                try:
+                    chars.append(chr(int(code, 16)))
+                    index += 4
+                except Exception:
+                    chars.append("\\u" + code)
+            else:
+                chars.append(escaped)
+        else:
+            chars.append(char)
+        index += 1
+    return "".join(chars)
+
+
+def extract_json_bool_value(text, key, default=False):
+    match = re.search(r'"{0}"\s*:\s*(true|false)'.format(re.escape(key)), str(text or ""), re.I)
+    if not match:
+        return default
+    return match.group(1).lower() == "true"
+
+
 def cleanup_ocr_text(text):
     text = str(text or "").strip()
     # Vision models sometimes preserve decorative title spacing or add spaces
@@ -546,6 +605,72 @@ def normalize_bool(value):
 
 def compact_heading_key(text):
     return re.sub(r"\s+", "", cleanup_ocr_text(text or ""))
+
+
+def text_coverage_length(text):
+    return len(re.sub(r"\s+", "", cleanup_ocr_text(text or "")))
+
+
+def rebuild_blocks_from_text_with_structural_hints(blocks, fallback_text):
+    heading_hints = {}
+    quote_hints = set()
+    continued_first = False
+    first_note_markers = []
+    for index, block in enumerate(blocks or []):
+        block_text = cleanup_ocr_text(block.get("text") or "")
+        key = compact_heading_key(block_text)
+        if not key:
+            continue
+        if index == 0 and normalize_bool(block.get("continued_from_previous")):
+            continued_first = True
+            first_note_markers = [str(x).strip() for x in (block.get("note_markers") or []) if str(x).strip()]
+        if block.get("type") == "heading":
+            heading_hints[key] = {
+                "level": max(1, min(6, int(block.get("level") or 2))),
+                "note_markers": [str(x).strip() for x in (block.get("note_markers") or []) if str(x).strip()],
+            }
+        elif block.get("type") == "quote":
+            quote_hints.add(key)
+
+    rebuilt = []
+    for paragraph in re.split(r"\n\s*\n+", fallback_text):
+        paragraph = cleanup_ocr_text(paragraph)
+        if not paragraph:
+            continue
+        marker_match = re.match(r"^(#{1,6})\s*(.+)$", paragraph)
+        if marker_match:
+            text = cleanup_ocr_text(marker_match.group(2))
+            key = compact_heading_key(text)
+            hint = heading_hints.get(key) or {}
+            block_type = "heading"
+            level = int(hint.get("level") or len(marker_match.group(1)))
+            note_markers = hint.get("note_markers") or []
+        else:
+            text = paragraph
+            key = compact_heading_key(text)
+            hint = heading_hints.get(key)
+            if hint:
+                block_type = "heading"
+                level = int(hint.get("level") or 2)
+                note_markers = hint.get("note_markers") or []
+            elif key in quote_hints:
+                block_type = "quote"
+                level = 0
+                note_markers = []
+            else:
+                block_type = "paragraph"
+                level = 0
+                note_markers = first_note_markers if not rebuilt and continued_first else []
+        rebuilt.append(
+            {
+                "type": block_type,
+                "level": max(1, min(6, level)) if block_type == "heading" else 0,
+                "text": text,
+                "continued_from_previous": bool(continued_first and not rebuilt and block_type == "paragraph"),
+                "note_markers": note_markers,
+            }
+        )
+    return rebuilt
 
 
 def normalize_blocks(data, fallback_text):
@@ -577,6 +702,12 @@ def normalize_blocks(data, fallback_text):
             }
         )
     if blocks:
+        fallback_len = text_coverage_length(fallback_text)
+        block_len = sum(text_coverage_length(block.get("text") or "") for block in blocks)
+        if fallback_len and block_len < fallback_len * 0.6:
+            rebuilt = rebuild_blocks_from_text_with_structural_hints(blocks, fallback_text)
+            if rebuilt:
+                return rebuilt
         return blocks
     for paragraph in re.split(r"\n\s*\n+", fallback_text):
         paragraph = cleanup_ocr_text(paragraph)
@@ -941,7 +1072,16 @@ def parse_toc_items(data, candidates):
     return items
 
 
-def plan_toc_chunk(client, candidates, settings, chunk_index, chunk_count, cancel_callback=None, retry_callback=None):
+def plan_toc_chunk(
+    client,
+    candidates,
+    settings,
+    chunk_index,
+    chunk_count,
+    cancel_callback=None,
+    retry_callback=None,
+    status_callback=None,
+):
     prompt = TOC_PROMPT
     if chunk_count > 1:
         prompt += "\n\n这是标题候选分块 {0}/{1}。只从本分块候选中选择目录项；不要补写其他分块的标题。".format(
@@ -957,17 +1097,51 @@ def plan_toc_chunk(client, candidates, settings, chunk_index, chunk_count, cance
     while True:
         if cancel_callback and cancel_callback():
             raise RuntimeError("Canceled by user")
+        started = time.time()
+        if status_callback:
+            status_callback(
+                "TOC chunk {0}/{1}: planning {2} candidate(s), attempt {3}...".format(
+                    chunk_index,
+                    chunk_count,
+                    len(candidates),
+                    attempt,
+                )
+            )
         try:
+            stream_state = {"chars": 0, "next_report": 2000}
+
+            def toc_stream_delta(delta):
+                stream_state["chars"] += len(delta or "")
+                if status_callback and stream_state["chars"] >= stream_state["next_report"]:
+                    status_callback(
+                        "TOC chunk {0}/{1}: received {2} streamed character(s)...".format(
+                            chunk_index,
+                            chunk_count,
+                            stream_state["chars"],
+                        )
+                    )
+                    stream_state["next_report"] += 2000
+
             result = client.text_chat(
                 prompt,
                 max_tokens=int(settings.get("toc_max_tokens", 65536)),
                 temperature=0,
-                stream_callback=lambda delta: None,
+                stream_callback=toc_stream_delta,
                 cancel_callback=cancel_callback,
             )
             data = parse_json_object(result.get("text") or "")
+            items = parse_toc_items(data, candidates)
+            if status_callback:
+                status_callback(
+                    "TOC chunk {0}/{1}: accepted {2} item(s) in {3:.1f}s.".format(
+                        chunk_index,
+                        chunk_count,
+                        len(items),
+                        time.time() - started,
+                    )
+                )
             return {
-                "items": parse_toc_items(data, candidates),
+                "items": items,
                 "raw": data,
                 "usage": result.get("usage") or {},
                 "fallback": False,
@@ -976,9 +1150,28 @@ def plan_toc_chunk(client, candidates, settings, chunk_index, chunk_count, cance
             if cancel_callback and cancel_callback():
                 raise RuntimeError("Canceled by user")
             if attempt >= 3 and retry_callback is None:
+                if status_callback:
+                    status_callback(
+                        "TOC chunk {0}/{1}: using fallback after {2:.1f}s failure: {3}".format(
+                            chunk_index,
+                            chunk_count,
+                            time.time() - started,
+                            str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+                        )
+                    )
                 return fallback_toc_plan(candidates, exc)
             if retry_callback is None:
                 raise
+            if status_callback:
+                status_callback(
+                    "TOC chunk {0}/{1}: attempt {2} failed after {3:.1f}s: {4}".format(
+                        chunk_index,
+                        chunk_count,
+                        attempt,
+                        time.time() - started,
+                        str(exc).splitlines()[0] if str(exc) else type(exc).__name__,
+                    )
+                )
             decision_page = -2 if attempt >= 3 else -1
             decision = retry_callback(decision_page, attempt, str(exc))
             if decision == "fallback":
@@ -988,20 +1181,31 @@ def plan_toc_chunk(client, candidates, settings, chunk_index, chunk_count, cance
             attempt += 1
 
 
-def plan_toc(page_results, settings, cancel_callback=None, retry_callback=None):
+def plan_toc(page_results, settings, cancel_callback=None, retry_callback=None, status_callback=None):
     candidates = filtered_toc_candidates(collect_toc_candidates(page_results))
     if not candidates:
+        if status_callback:
+            status_callback("TOC planning skipped: no heading candidates.")
         return {"items": []}
     client = LocalLlmClient(
         settings.get("base_url"),
         model=settings.get("model"),
-        timeout=max(1800, int(settings.get("request_timeout", 180))),
+        timeout=max(3600, int(settings.get("request_timeout", 180))),
     )
-    chunks = toc_candidate_chunks(candidates, int(settings.get("toc_chunk_size", 120) or 120))
+    chunks = toc_candidate_chunks(candidates, int(settings.get("toc_chunk_size", 60) or 60))
+    if status_callback:
+        status_callback(
+            "TOC planning: {0} candidate(s), {1} chunk(s), chunk size {2}.".format(
+                len(candidates),
+                len(chunks),
+                max(len(chunk) for chunk in chunks) if chunks else 0,
+            )
+        )
     merged_items = []
     seen = set()
     raw_chunks = []
     fallback_reasons = []
+    started = time.time()
     for index, chunk in enumerate(chunks, 1):
         chunk_plan = plan_toc_chunk(
             client,
@@ -1011,6 +1215,7 @@ def plan_toc(page_results, settings, cancel_callback=None, retry_callback=None):
             len(chunks),
             cancel_callback=cancel_callback,
             retry_callback=retry_callback,
+            status_callback=status_callback,
         )
         raw_chunks.append(chunk_plan.get("raw") or {})
         if chunk_plan.get("fallback"):
@@ -1021,6 +1226,21 @@ def plan_toc(page_results, settings, cancel_callback=None, retry_callback=None):
                 continue
             seen.add(key)
             merged_items.append(item)
+        if status_callback:
+            status_callback(
+                "TOC planning progress: {0}/{1} chunk(s), {2} merged item(s).".format(
+                    index,
+                    len(chunks),
+                    len(merged_items),
+                )
+            )
+    if status_callback:
+        status_callback(
+            "TOC planning finished in {0:.1f}s with {1} item(s).".format(
+                time.time() - started,
+                len(merged_items),
+            )
+        )
     return {
         "items": merged_items,
         "raw_chunks": raw_chunks,
@@ -1031,23 +1251,69 @@ def plan_toc(page_results, settings, cancel_callback=None, retry_callback=None):
     }
 
 
+def invalid_json_error(response_text, raw_response=None):
+    preview = str(response_text or "").strip()[:1000]
+    finish_reason = model_finish_reason(raw_response)
+    if finish_reason in ("length", "max_tokens"):
+        return InvalidJsonResponseError(
+            "Model response was not valid JSON because it was truncated by the page max_tokens budget.\n\n{0}".format(
+                preview
+            ),
+            response_text=response_text,
+            raw_response=raw_response,
+        )
+    return InvalidJsonResponseError(
+        "Model response was not valid JSON.\n\n{0}".format(preview),
+        response_text=response_text,
+        raw_response=raw_response,
+    )
+
+
+def backup_page_result_from_invalid_json(page_number, image_path, response_text, usage=None, seconds=None, raw_response=None):
+    text = cleanup_ocr_text(extract_json_string_value(response_text, "text"))
+    if not text:
+        raise invalid_json_error(response_text, raw_response)
+    data = {
+        "text": text,
+        "page_continues_previous": extract_json_bool_value(response_text, "page_continues_previous", False),
+        "page_role": extract_json_string_value(response_text, "page_role") or "unknown",
+        "title": extract_json_string_value(response_text, "title"),
+        "blocks": [],
+        "has_illustrations": False,
+        "illustrations": [],
+        "notes": [],
+        "_backup_from_invalid_json": True,
+    }
+    blocks = normalize_blocks(data, text)
+    return {
+        "page": int(page_number),
+        "image_path": str(image_path),
+        "text": text,
+        "blocks": blocks,
+        "page_continues_previous": normalize_bool(data.get("page_continues_previous")),
+        "page_role": str(data.get("page_role") or "unknown"),
+        "title": str(data.get("title") or "").strip(),
+        "has_illustrations": False,
+        "illustrations": [],
+        "notes": [],
+        "usage": usage or {},
+        "seconds": seconds,
+        "raw": {
+            "_backup_from_invalid_json": True,
+            "response_text": response_text,
+            "raw_response": raw_response or {},
+        },
+    }
+
+
 def normalize_page_result(page_number, image_path, response_text, usage=None, seconds=None, settings=None, raw_response=None):
     try:
         data = parse_json_object(response_text)
         text = cleanup_ocr_text(data.get("text") or "")
     except Exception:
-        preview = str(response_text or "").strip()[:1000]
-        finish_reason = model_finish_reason(raw_response)
-        if finish_reason in ("length", "max_tokens"):
-            raise RuntimeError(
-                "Model response was not valid JSON because it was truncated by the page max_tokens budget.\n\n{0}".format(
-                    preview
-                )
-            )
-        raise RuntimeError("Model response was not valid JSON.\n\n{0}".format(preview))
+        raise invalid_json_error(response_text, raw_response)
     if not isinstance(data, dict):
-        preview = str(response_text or "").strip()[:1000]
-        raise RuntimeError("Model response was not valid JSON.\n\n{0}".format(preview))
+        raise invalid_json_error(response_text, raw_response)
     blocks = normalize_blocks(data, text)
     if not text and blocks:
         text = blocks_to_markdown(blocks)
@@ -1089,7 +1355,7 @@ def normalize_page_result(page_number, image_path, response_text, usage=None, se
 
 def model_finish_reason(raw_response):
     try:
-        return str(((raw_response.get("choices") or [{}])[0]).get("finish_reason") or "")
+        return str(((raw_response.get("choices") or [{}])[0]).get("finish_reason") or "").strip().lower()
     except Exception:
         return ""
 
@@ -1142,6 +1408,7 @@ def ocr_page_with_retry(
     retry_callback=None,
 ):
     attempt = 1
+    previous_invalid_response = None
     while True:
         if cancel_callback and cancel_callback():
             raise RuntimeError("Canceled by user")
@@ -1150,6 +1417,31 @@ def ocr_page_with_retry(
             if attempt > 1:
                 attempt_settings["_compact_page_json"] = True
             return ocr_page(page_number, image_path, attempt_settings, stream_callback, cancel_callback)
+        except InvalidJsonResponseError as exc:
+            if cancel_callback and cancel_callback():
+                raise RuntimeError("Canceled by user")
+            response_key = str(exc.response_text or "").strip()
+            finish_reason = model_finish_reason(exc.raw_response)
+            if (
+                response_key
+                and previous_invalid_response == response_key
+                and finish_reason not in ("length", "max_tokens")
+            ):
+                return backup_page_result_from_invalid_json(
+                    page_number,
+                    image_path,
+                    exc.response_text,
+                    usage={},
+                    seconds=None,
+                    raw_response=exc.raw_response,
+                )
+            previous_invalid_response = response_key
+            if retry_callback is None:
+                raise
+            decision = retry_callback(page_number, attempt, str(exc))
+            if decision == "abandon":
+                raise RuntimeError("Abandoned by user")
+            attempt += 1
         except Exception as exc:
             if cancel_callback and cancel_callback():
                 raise RuntimeError("Canceled by user")
@@ -1265,7 +1557,7 @@ def choose_cover_page(
         model=settings.get("model"),
         timeout=int(settings.get("request_timeout", 180)),
     )
-    if count > 1:
+    if count > 1 and settings.get("cover_multi_image", False):
         while True:
             if cancel_callback and cancel_callback():
                 raise RuntimeError("Canceled by user")

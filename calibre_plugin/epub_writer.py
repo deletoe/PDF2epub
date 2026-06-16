@@ -661,9 +661,23 @@ def planned_heading_keys_from_toc(toc_plan):
     return keys
 
 
-def write_epub(output_path, title, authors, page_results, cover_image_path=None, cover_page=None, toc_plan=None):
+def write_epub(
+    output_path,
+    title,
+    authors,
+    page_results,
+    cover_image_path=None,
+    cover_page=None,
+    toc_plan=None,
+    progress_callback=None,
+):
+    def report(message):
+        if progress_callback:
+            progress_callback(message)
+
     output_path = Path(output_path)
     work_dir = output_path.parent / (output_path.stem + "_epub_build")
+    report("EPUB build: preparing work directory...")
     if work_dir.exists():
         shutil.rmtree(str(work_dir))
     (work_dir / "META-INF").mkdir(parents=True)
@@ -714,6 +728,7 @@ aside.note sup { margin-right: .35em; }
     spine_items = ['<itemref idref="body"/>']
 
     if cover_image_path:
+        report("EPUB build: copying cover image...")
         copy_cover_image(cover_image_path, work_dir / "OEBPS" / "images" / "cover.jpg")
         cover_body = '<div class="cover"><img src="../images/cover.jpg" alt="cover"/></div>'
         (work_dir / "OEBPS" / "text" / "cover.xhtml").write_text(xhtml_document("封面", cover_body), encoding="utf-8")
@@ -721,12 +736,20 @@ aside.note sup { margin-right: .35em; }
         manifest_items.append('<item id="cover-image" href="images/cover.jpg" media-type="image/jpeg" properties="cover-image"/>')
         spine_items.insert(0, '<itemref idref="cover-page"/>')
 
+    report("EPUB build: rendering body XHTML from {0} OCR page(s)...".format(len(page_results or [])))
     body, image_items, toc_entries = build_body_pages(
         page_results,
         work_dir / "OEBPS" / "images",
         planned_heading_keys=planned_heading_keys_from_toc(toc_plan),
     )
+    report(
+        "EPUB build: body rendered with {0} illustration image(s) and {1} heading anchor(s).".format(
+            len(image_items),
+            len(toc_entries),
+        )
+    )
     toc_entries = apply_toc_plan(toc_entries, toc_plan)
+    report("EPUB build: final TOC contains {0} item(s).".format(len(toc_entries)))
     if not body.strip():
         body = "<p>OCR produced no text.</p>"
     (work_dir / "OEBPS" / "text" / "body.xhtml").write_text(
@@ -739,6 +762,7 @@ aside.note sup { margin-right: .35em; }
             '<item id="img{0}" href="images/{1}" media-type="{2}"/>'.format(index, html.escape(image_name), mime)
         )
 
+    report("EPUB build: writing navigation files...")
     nav = """<?xml version="1.0" encoding="utf-8"?>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="zh-CN" lang="zh-CN">
 <head><title>目录</title><link rel="stylesheet" type="text/css" href="styles/style.css"/></head>
@@ -748,6 +772,7 @@ aside.note sup { margin-right: .35em; }
     (work_dir / "OEBPS" / "nav.xhtml").write_text(nav, encoding="utf-8")
     (work_dir / "OEBPS" / "toc.ncx").write_text(ncx_document(title, toc_entries), encoding="utf-8")
 
+    report("EPUB build: writing OPF manifest...")
     author_xml = "\n".join("<dc:creator>{0}</dc:creator>".format(html.escape(a)) for a in (authors or []))
     metadata_cover = '<meta name="cover" content="cover-image"/>' if cover_image_path else ""
     opf = """<?xml version="1.0" encoding="utf-8"?>
@@ -777,10 +802,14 @@ aside.note sup { margin-right: .35em; }
 
     if output_path.exists():
         output_path.unlink()
+    files_to_zip = [path for path in sorted(work_dir.rglob("*")) if path.is_file() and path.name != "mimetype"]
+    report("EPUB build: zipping {0} file(s)...".format(len(files_to_zip) + 1))
     with ZipFile(str(output_path), "w") as zf:
         zf.write(str(work_dir / "mimetype"), "mimetype", compress_type=ZIP_STORED)
-        for path in sorted(work_dir.rglob("*")):
-            if path.is_file() and path.name != "mimetype":
-                zf.write(str(path), path.relative_to(work_dir).as_posix(), compress_type=ZIP_DEFLATED)
+        for index, path in enumerate(files_to_zip, 1):
+            zf.write(str(path), path.relative_to(work_dir).as_posix(), compress_type=ZIP_DEFLATED)
+            if index == len(files_to_zip) or index % 25 == 0:
+                report("EPUB build: zipped {0}/{1} file(s).".format(index + 1, len(files_to_zip) + 1))
     shutil.rmtree(str(work_dir), ignore_errors=True)
+    report("EPUB build: finished.")
     return output_path

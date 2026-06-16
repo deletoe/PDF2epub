@@ -328,12 +328,15 @@ class PdfOcrWorker(QThread):
             self.log.emit("OCR recovery cache written: {0}".format(recovery_path))
 
             self.status.emit("Planning EPUB table of contents...")
+            self.progress.emit(0, 3)
             toc_plan = pdf_ocr_core.plan_toc(
                 results,
                 self.settings,
                 cancel_callback=self.is_cancelled,
                 retry_callback=self.request_retry_decision,
+                status_callback=self.log.emit,
             )
+            self.progress.emit(1, 3)
             self.log.emit("TOC planned with {0} item(s).".format(len(toc_plan.get("items") or [])))
             if toc_plan.get("chunk_count"):
                 self.log.emit(
@@ -356,7 +359,9 @@ class PdfOcrWorker(QThread):
                 cover_image_path=image_paths[max(0, cover_page - 1)],
                 cover_page=cover_page,
                 toc_plan=toc_plan,
+                progress_callback=self.log.emit,
             )
+            self.progress.emit(2, 3)
             self.log.emit("EPUB written: {0}".format(output_path))
             if self.settings.get("keep_page_images"):
                 kept = self.output_dir / (epub_writer.safe_name(self.title, self.pdf_path.stem) + "_pages")
@@ -370,6 +375,7 @@ class PdfOcrWorker(QThread):
                     self.log.emit("OCR recovery cache removed after successful output.")
                 except Exception:
                     pass
+            self.progress.emit(3, 3)
             self.finished_ok.emit({"epub_path": str(output_path), "page_count": total_pages, "cover_page": cover_page})
         except RuntimeError as exc:
             if "Canceled by user" in str(exc) or "Abandoned by user" in str(exc):

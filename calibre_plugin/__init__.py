@@ -14,7 +14,7 @@ class LocalPdfOcrBase(InterfaceActionBase):
     description = "Convert scanned PDFs to reflowable EPUBs with a local OpenAI-compatible vision LLM."
     supported_platforms = ["windows", "osx", "linux"]
     author = "Local PDF OCR contributors"
-    version = (0, 1, 1)
+    version = (0, 1, 2)
     minimum_calibre_version = (5, 0, 0)
     actual_plugin = "calibre_plugins.local_pdf_ocr.ui:LocalPdfOcrAction"
 
