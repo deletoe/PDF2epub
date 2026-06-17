@@ -26,6 +26,7 @@ PAGE_PROMPT = """请把这页中文扫描书页转写为可重排电子书文本
 要求：
 1. 只输出页面中真实可见的文字，不要补写下一页或推测缺失内容。
 1a. 如果页末是未完句、跨页断词或未完引文，按原页可见文字停住；不要为了句子完整而补标点、补字或补闭引号。
+1b. 即使页面只有一个月份、章节题名、页签或极少量文字，也必须输出这些可见文字；不要返回空对象 {}。真正空白页也必须按 schema 返回 page_role="blank"、text=""、blocks=[]。污迹、透印、扫描噪点或无法清楚辨认的残字不要猜测或补写。
 2. 去掉页码、装饰线、页眉、页脚。页眉通常是每页顶部反复出现的书名/章节名/栏目名，例如“阿莱克修斯传”等；除非它也是本页正文中的真实标题，否则不要放入正文。
 3. 合并同一自然段内的换行；对话另起段。
 4. 使用中文标点。不要改写原文。
@@ -522,11 +523,51 @@ def parse_json_object(text):
     raise ValueError("No JSON object found")
 
 
+def escape_control_chars_in_json_strings(text):
+    text = str(text or "")
+    chars = []
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                chars.append(char)
+                escaped = False
+                continue
+            if char == "\\":
+                chars.append(char)
+                escaped = True
+                continue
+            if char == '"':
+                chars.append(char)
+                in_string = False
+                continue
+            if char == "\n":
+                chars.append("\\n")
+                continue
+            if char == "\r":
+                chars.append("\\r")
+                continue
+            if char == "\t":
+                chars.append("\\t")
+                continue
+            if ord(char) < 32:
+                continue
+            chars.append(char)
+            continue
+        chars.append(char)
+        if char == '"':
+            in_string = True
+            escaped = False
+    return "".join(chars)
+
+
 def repair_json_object_text(text):
     text = str(text or "")
     # Common LLM typo: an object key gains one extra quote, e.g.
     # ,""page_role": "body". Restrict the repair to JSON key positions.
     text = re.sub(r'([{\[,]\s*)""([A-Za-z_][A-Za-z0-9_]*)"\s*:', r'\1"\2":', text)
+    text = escape_control_chars_in_json_strings(text)
     return text
 
 
