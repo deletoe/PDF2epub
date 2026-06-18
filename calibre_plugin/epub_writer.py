@@ -313,20 +313,27 @@ def copy_cover_image(source, dest):
 def crop_illustration(source, bbox, dest):
     if Image is None:
         return False
-    source = Path(source)
-    dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    image = Image.open(str(source)).convert("RGB")
-    width, height = image.size
-    x1, y1, x2, y2 = bbox
-    left = int(max(0, min(width - 1, x1 * width)))
-    top = int(max(0, min(height - 1, y1 * height)))
-    right = int(max(left + 1, min(width, x2 * width)))
-    bottom = int(max(top + 1, min(height, y2 * height)))
-    cropped = image.crop((left, top, right, bottom))
-    cropped.thumbnail((1400, 1800))
-    cropped.save(str(dest), quality=88)
-    return True
+    try:
+        if not source or not bbox or len(bbox) != 4:
+            return False
+        source = Path(source)
+        if not source.exists():
+            return False
+        dest = Path(dest)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        image = Image.open(str(source)).convert("RGB")
+        width, height = image.size
+        x1, y1, x2, y2 = [float(value) for value in bbox]
+        left = int(max(0, min(width - 1, x1 * width)))
+        top = int(max(0, min(height - 1, y1 * height)))
+        right = int(max(left + 1, min(width, x2 * width)))
+        bottom = int(max(top + 1, min(height, y2 * height)))
+        cropped = image.crop((left, top, right, bottom))
+        cropped.thumbnail((1400, 1800))
+        cropped.save(str(dest), quality=88)
+        return True
+    except Exception:
+        return False
 
 
 def xhtml_document(title, body):
@@ -354,16 +361,17 @@ def build_body_pages(page_results, images_dir, planned_heading_keys=None):
     for result in page_results:
         role = result.get("page_role")
         text = result.get("text") or ""
-        if role == "blank" and not text:
+        page_illustrations = list(result.get("illustrations") or [])
+        if role == "blank" and not text and not page_illustrations:
             continue
         blocks = list(result.get("blocks") or fallback_blocks_from_text(text))
         illustration_captions = set()
-        for illustration in result.get("illustrations") or []:
+        for illustration in page_illustrations:
             caption_key = compact_text_key(illustration.get("caption") or "")
             if caption_key:
                 illustration_captions.add(caption_key)
         illustration_html = []
-        for illustration in result.get("illustrations") or []:
+        for illustration in page_illustrations:
             illustration_index += 1
             image_name = "illustration_{0:04d}.jpg".format(illustration_index)
             image_path = images_dir / image_name

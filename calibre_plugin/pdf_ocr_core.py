@@ -1113,6 +1113,74 @@ def parse_toc_items(data, candidates):
     return items
 
 
+def iter_complete_json_objects(text):
+    text = repair_json_object_text(text)
+    stack = []
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            escaped = False
+            continue
+        if char == "{":
+            stack.append(index)
+            continue
+        if char == "}":
+            if not stack:
+                continue
+            start = stack.pop()
+            yield text[start : index + 1]
+
+
+def salvage_toc_items_from_text(text, candidates):
+    items = []
+    for object_text in iter_complete_json_objects(text):
+        try:
+            data = json.loads(object_text)
+        except ValueError:
+            continue
+        if not isinstance(data, dict):
+            continue
+        if "items" in data:
+            items.extend(parse_toc_items(data, candidates))
+        elif {"page", "block_index", "label"}.issubset(set(data)):
+            items.extend(parse_toc_items({"items": [data]}, candidates))
+    deduped = []
+    seen = set()
+    for item in items:
+        key = (int(item.get("page") or 0), int(item.get("block_index") or 0))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+    return deduped
+
+
+def build_toc_json_correction_prompt(candidates, error_message, previous_response):
+    return (
+        "上一次 EPUB 目录规划返回的内容不是合法 JSON。请根据错误信息修正它，只输出一个严格 JSON 对象，"
+        "不要 Markdown 代码块，不要解释，不要新增候选之外的目录项。\n\n"
+        "合法输出格式仍然是：\n"
+        '{{"items":[{{"page":1,"block_index":0,"label":"标题","level":1,"reason":"简短原因"}}]}}\n\n'
+        "可用标题候选：\n{candidates}\n\n"
+        "JSON 解析错误：\n{error}\n\n"
+        "上一次原始返回：\n{response}"
+    ).format(
+        candidates=json.dumps(compact_toc_candidates(candidates), ensure_ascii=False, separators=(",", ":")),
+        error=str(error_message or "")[:2000],
+        response=str(previous_response or "")[:24000],
+    )
+
+
 def plan_toc_chunk(
     client,
     candidates,
@@ -1135,6 +1203,7 @@ def plan_toc_chunk(
         separators=(",", ":"),
     )
     attempt = 1
+    correction_attempted = False
     while True:
         if cancel_callback and cancel_callback():
             raise RuntimeError("Canceled by user")
@@ -1170,8 +1239,44 @@ def plan_toc_chunk(
                 stream_callback=toc_stream_delta,
                 cancel_callback=cancel_callback,
             )
-            data = parse_json_object(result.get("text") or "")
-            items = parse_toc_items(data, candidates)
+            response_text = result.get("text") or ""
+            try:
+                data = parse_json_object(response_text)
+                items = parse_toc_items(data, candidates)
+            except Exception as parse_exc:
+                if not correction_attempted:
+                    correction_attempted = True
+                    prompt = build_toc_json_correction_prompt(candidates, parse_exc, response_text)
+                    attempt += 1
+                    if status_callback:
+                        status_callback(
+                            "TOC chunk {0}/{1}: JSON parse failed; retrying once with the error and previous response.".format(
+                                chunk_index,
+                                chunk_count,
+                            )
+                        )
+                    continue
+                items = salvage_toc_items_from_text(response_text, candidates)
+                if not items:
+                    fallback = fallback_toc_plan(candidates, parse_exc)
+                    fallback["fallback_reason"] = "TOC JSON correction failed; using fallback. {0}".format(parse_exc)
+                    if status_callback:
+                        status_callback(
+                            "TOC chunk {0}/{1}: JSON correction failed; using fallback TOC rules.".format(
+                                chunk_index,
+                                chunk_count,
+                            )
+                        )
+                    return fallback
+                data = {"items": items, "_salvaged_from_partial_json": True}
+                if status_callback:
+                    status_callback(
+                        "TOC chunk {0}/{1}: salvaged {2} complete item(s) after correction failed.".format(
+                            chunk_index,
+                            chunk_count,
+                            len(items),
+                        )
+                    )
             if status_callback:
                 status_callback(
                     "TOC chunk {0}/{1}: accepted {2} item(s) in {3:.1f}s.".format(
@@ -1310,6 +1415,55 @@ def invalid_json_error(response_text, raw_response=None):
     )
 
 
+def build_page_json_correction_prompt(error_message, previous_response):
+    return (
+        "上一次单页 OCR 返回的内容不是可用的合法 JSON。请只修正 JSON 格式，不要重新 OCR、不要补写新内容，"
+        "不要 Markdown 代码块，不要解释。\n\n"
+        "必须返回这个 schema 的一个 JSON 对象：\n"
+        "{{"
+        '"text":"本页完整可重排正文，标题可用 Markdown # 标出",'
+        '"page_continues_previous":false,'
+        '"page_role":"cover|front_matter|toc|body|illustration|blank|copyright|unknown",'
+        '"title":"",'
+        '"blocks":[],'
+        '"has_illustrations":false,'
+        '"illustrations":[],'
+        '"notes":[]'
+        "}}\n\n"
+        "如果上一次返回里能看到 text 字段，请保留其中的正文。"
+        "如果无法恢复正文且页面确实表示为空白，返回 page_role=\"blank\"、text=\"\"、blocks=[]。"
+        "不要把错误信息写进正文。\n\n"
+        "JSON 解析/校验错误：\n{error}\n\n"
+        "上一次原始返回：\n{response}"
+    ).format(
+        error=str(error_message or "")[:2000],
+        response=str(previous_response or "")[:24000],
+    )
+
+
+def correct_page_json_response(page_number, image_path, settings, invalid_error, cancel_callback=None):
+    client = LocalLlmClient(
+        settings.get("base_url"),
+        model=settings.get("model"),
+        timeout=int(settings.get("request_timeout", 180)),
+    )
+    result = client.text_chat(
+        build_page_json_correction_prompt(invalid_error, invalid_error.response_text),
+        max_tokens=min(page_max_tokens(settings), 8192),
+        temperature=0,
+        cancel_callback=cancel_callback,
+    )
+    return normalize_page_result(
+        page_number,
+        image_path,
+        result.get("text") or "",
+        usage=result.get("usage") or {},
+        seconds=result.get("seconds"),
+        settings=settings,
+        raw_response=result.get("raw") or {},
+    )
+
+
 def backup_page_result_from_invalid_json(page_number, image_path, response_text, usage=None, seconds=None, raw_response=None):
     text = cleanup_ocr_text(extract_json_string_value(response_text, "text"))
     if not text:
@@ -1359,7 +1513,11 @@ def normalize_page_result(page_number, image_path, response_text, usage=None, se
     if not text and blocks:
         text = blocks_to_markdown(blocks)
     if not text.strip() and str(data.get("page_role") or "") not in ("blank", "cover"):
-        raise RuntimeError("Model response JSON did not contain usable OCR text.")
+        raise InvalidJsonResponseError(
+            "Model response JSON did not contain usable OCR text.",
+            response_text=response_text,
+            raw_response=raw_response,
+        )
     illustrations = []
     for item in data.get("illustrations") or []:
         bbox = item.get("bbox") or []
@@ -1450,6 +1608,8 @@ def ocr_page_with_retry(
 ):
     attempt = 1
     previous_invalid_response = None
+    correction_failed_responses = set()
+    backup_failed_responses = set()
     while True:
         if cancel_callback and cancel_callback():
             raise RuntimeError("Canceled by user")
@@ -1465,17 +1625,30 @@ def ocr_page_with_retry(
             finish_reason = model_finish_reason(exc.raw_response)
             if (
                 response_key
-                and previous_invalid_response == response_key
+                and response_key not in correction_failed_responses
                 and finish_reason not in ("length", "max_tokens")
             ):
-                return backup_page_result_from_invalid_json(
-                    page_number,
-                    image_path,
-                    exc.response_text,
-                    usage={},
-                    seconds=None,
-                    raw_response=exc.raw_response,
-                )
+                try:
+                    return correct_page_json_response(page_number, image_path, settings, exc, cancel_callback)
+                except Exception:
+                    correction_failed_responses.add(response_key)
+            if (
+                response_key
+                and previous_invalid_response == response_key
+                and response_key not in backup_failed_responses
+                and finish_reason not in ("length", "max_tokens")
+            ):
+                try:
+                    return backup_page_result_from_invalid_json(
+                        page_number,
+                        image_path,
+                        exc.response_text,
+                        usage={},
+                        seconds=None,
+                        raw_response=exc.raw_response,
+                    )
+                except InvalidJsonResponseError:
+                    backup_failed_responses.add(response_key)
             previous_invalid_response = response_key
             if retry_callback is None:
                 raise
