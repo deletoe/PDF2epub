@@ -3,7 +3,13 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 import base64
 import json
 import time
+from io import BytesIO
 from pathlib import Path
+
+try:
+    from PIL import Image
+except Exception:  # pragma: no cover - depends on Calibre runtime.
+    Image = None
 
 try:
     from urllib.error import HTTPError
@@ -22,19 +28,39 @@ def normalize_base_url(base_url):
     return base_url
 
 
-def image_data_url(path):
+def image_data_url(path, max_side=2400):
     path = Path(path)
     suffix = path.suffix.lower()
     mime = "image/jpeg" if suffix in (".jpg", ".jpeg") else "image/png"
+    max_side = int(max_side or 0)
+    if Image is not None and max_side > 0:
+        try:
+            image = Image.open(str(path)).convert("RGB")
+            width, height = image.size
+            longest = max(width, height)
+            if longest > max_side:
+                scale = float(max_side) / float(longest)
+                resized = image.resize(
+                    (max(1, int(width * scale)), max(1, int(height * scale))),
+                    Image.Resampling.LANCZOS if hasattr(Image, "Resampling") else Image.LANCZOS,
+                )
+                output = BytesIO()
+                resized.save(output, format="JPEG", quality=90)
+                mime = "image/jpeg"
+                data = base64.b64encode(output.getvalue()).decode("ascii")
+                return "data:{0};base64,{1}".format(mime, data)
+        except Exception:
+            pass
     data = base64.b64encode(path.read_bytes()).decode("ascii")
     return "data:{0};base64,{1}".format(mime, data)
 
 
 class LocalLlmClient(object):
-    def __init__(self, base_url, model=None, timeout=180):
+    def __init__(self, base_url, model=None, timeout=180, max_image_side=2400):
         self.base_url = normalize_base_url(base_url)
         self.model = str(model or "").strip() or None
         self.timeout = int(timeout or 180)
+        self.max_image_side = int(max_image_side or 0)
 
     def resolve_model(self):
         if self.model:
@@ -53,7 +79,7 @@ class LocalLlmClient(object):
     def vision_chat(self, prompt, image_paths, max_tokens, temperature=0, stream_callback=None, cancel_callback=None):
         content = [{"type": "text", "text": prompt}]
         for path in image_paths:
-            content.append({"type": "image_url", "image_url": {"url": image_data_url(path)}})
+            content.append({"type": "image_url", "image_url": {"url": image_data_url(path, self.max_image_side)}})
         payload = {
             "model": self.resolve_model(),
             "messages": [{"role": "user", "content": content}],
@@ -90,6 +116,8 @@ class LocalLlmClient(object):
                 data = json.loads(response.read().decode("utf-8"))
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
+            if is_vision_preprocess_error(detail):
+                raise RuntimeError(self._vision_preprocess_error_message(exc.code, detail))
             raise RuntimeError("LLM request failed: HTTP {0}\n{1}".format(exc.code, detail))
         except URLError as exc:
             reason = exc.reason if hasattr(exc, "reason") else str(exc)
@@ -137,6 +165,8 @@ class LocalLlmClient(object):
                         stream_callback(text)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
+            if is_vision_preprocess_error(detail):
+                raise RuntimeError(self._vision_preprocess_error_message(exc.code, detail))
             raise RuntimeError("LLM stream failed: HTTP {0}\n{1}".format(exc.code, detail))
         except URLError as exc:
             reason = exc.reason if hasattr(exc, "reason") else str(exc)
@@ -147,3 +177,20 @@ class LocalLlmClient(object):
             "seconds": time.time() - started,
             "raw": {"choices": [{"finish_reason": finish_reason}]},
         }
+
+    def _vision_preprocess_error_message(self, status_code, detail):
+        return (
+            "LLM vision preprocessing failed: HTTP {0}. "
+            "The image may still be too large for the Qwen VL processor, or the model server may not accept this "
+            "multi-image request. Current Vision image max side is {1}; try lowering it, for example to 2000 or 1800. "
+            "Raw server response:\n{2}"
+        ).format(status_code, self.max_image_side or "disabled", detail)
+
+
+def is_vision_preprocess_error(detail):
+    detail = str(detail or "")
+    return (
+        "Qwen3VLProcessor" in detail
+        or "Qwen2VLProcessor" in detail
+        or ("Failed to apply" in detail and "images" in detail)
+    )

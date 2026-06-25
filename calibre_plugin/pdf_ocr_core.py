@@ -644,6 +644,17 @@ def normalize_bool(value):
     return bool(value)
 
 
+def vision_max_image_side(settings):
+    try:
+        return int((settings or {}).get("vision_max_image_side", 2400) or 0)
+    except Exception:
+        return 2400
+
+
+def is_fatal_vision_preprocess_error(error):
+    return "LLM vision preprocessing failed" in str(error or "")
+
+
 def compact_heading_key(text):
     return re.sub(r"\s+", "", cleanup_ocr_text(text or ""))
 
@@ -841,6 +852,7 @@ def semantic_repair_patch(page_results, image_paths, settings, risk_summary, can
         settings.get("base_url"),
         model=settings.get("model"),
         timeout=int(settings.get("request_timeout", 180)),
+        max_image_side=vision_max_image_side(settings),
     )
     prompt = build_semantic_repair_prompt(page_results, risk_summary)
     result = client.vision_chat(
@@ -1026,6 +1038,7 @@ def plan_toc_single_request(page_results, settings, cancel_callback=None, retry_
         settings.get("base_url"),
         model=settings.get("model"),
         timeout=max(600, int(settings.get("request_timeout", 180))),
+        max_image_side=vision_max_image_side(settings),
     )
     prompt = TOC_PROMPT + "\n\n标题候选：\n" + json.dumps(compact_toc_candidates(candidates), ensure_ascii=False, separators=(",", ":"))
     attempt = 1
@@ -1337,6 +1350,7 @@ def plan_toc(page_results, settings, cancel_callback=None, retry_callback=None, 
         settings.get("base_url"),
         model=settings.get("model"),
         timeout=max(3600, int(settings.get("request_timeout", 180))),
+        max_image_side=vision_max_image_side(settings),
     )
     chunks = toc_candidate_chunks(candidates, int(settings.get("toc_chunk_size", 60) or 60))
     if status_callback:
@@ -1446,6 +1460,7 @@ def correct_page_json_response(page_number, image_path, settings, invalid_error,
         settings.get("base_url"),
         model=settings.get("model"),
         timeout=int(settings.get("request_timeout", 180)),
+        max_image_side=vision_max_image_side(settings),
     )
     result = client.text_chat(
         build_page_json_correction_prompt(invalid_error, invalid_error.response_text),
@@ -1569,6 +1584,7 @@ def ocr_page(page_number, image_path, settings, stream_callback=None, cancel_cal
         settings.get("base_url"),
         model=settings.get("model"),
         timeout=int(settings.get("request_timeout", 180)),
+        max_image_side=vision_max_image_side(settings),
     )
     chunks = []
 
@@ -1659,6 +1675,8 @@ def ocr_page_with_retry(
         except Exception as exc:
             if cancel_callback and cancel_callback():
                 raise RuntimeError("Canceled by user")
+            if is_fatal_vision_preprocess_error(exc):
+                raise
             if retry_callback is None:
                 raise
             decision = retry_callback(page_number, attempt, str(exc))
@@ -1770,6 +1788,7 @@ def choose_cover_page(
         settings.get("base_url"),
         model=settings.get("model"),
         timeout=int(settings.get("request_timeout", 180)),
+        max_image_side=vision_max_image_side(settings),
     )
     if count > 1 and settings.get("cover_multi_image", False):
         while True:
@@ -1792,6 +1811,8 @@ def choose_cover_page(
                 message = str(exc)
                 if cancel_callback and cancel_callback():
                     raise RuntimeError("Canceled by user")
+                if is_fatal_vision_preprocess_error(message):
+                    raise
                 if "400" not in message and "BadRequestError" not in message:
                     if retry_callback is None:
                         return 1, "Cover detection response was not JSON"
@@ -1843,6 +1864,8 @@ def choose_cover_page(
                 except Exception as exc:
                     if cancel_callback and cancel_callback():
                         raise RuntimeError("Canceled by user")
+                    if is_fatal_vision_preprocess_error(exc):
+                        raise
                     if retry_callback is None:
                         break
                     decision = retry_callback(0, page_attempt, str(exc))

@@ -14,6 +14,7 @@ DEFAULT_PREFS = {
     "max_tokens_per_page": 65536,
     "toc_max_tokens": 65536,
     "toc_chunk_size": 60,
+    "vision_max_image_side": 2400,
     "recent_page_buffer": 6,
     "cover_scan_pages": 5,
     "cover_multi_image": True,
@@ -92,6 +93,12 @@ class ConfigWidget(QWidget):
         self.toc_chunk_size.setValue(int(values["toc_chunk_size"]))
         form.addRow("TOC candidate chunk size", self.toc_chunk_size)
 
+        self.vision_max_image_side = QSpinBox()
+        self.vision_max_image_side.setRange(0, 10000)
+        self.vision_max_image_side.setSingleStep(100)
+        self.vision_max_image_side.setValue(int(values["vision_max_image_side"]))
+        form.addRow("Vision image max side (0 disables resize)", self.vision_max_image_side)
+
         self.recent_page_buffer = QSpinBox()
         self.recent_page_buffer.setRange(1, 50)
         self.recent_page_buffer.setValue(int(values["recent_page_buffer"]))
@@ -136,6 +143,7 @@ class ConfigWidget(QWidget):
         prefs["max_tokens_per_page"] = int(self.max_tokens_per_page.value())
         prefs["toc_max_tokens"] = int(self.toc_max_tokens.value())
         prefs["toc_chunk_size"] = int(self.toc_chunk_size.value())
+        prefs["vision_max_image_side"] = int(self.vision_max_image_side.value())
         prefs["recent_page_buffer"] = int(self.recent_page_buffer.value())
         prefs["detect_cover"] = self.detect_cover.isChecked()
         prefs["cover_scan_pages"] = int(self.cover_scan_pages.value())
