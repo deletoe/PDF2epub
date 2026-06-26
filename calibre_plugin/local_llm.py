@@ -2,6 +2,7 @@ from __future__ import absolute_import, division, print_function, unicode_litera
 
 import base64
 import json
+import re
 import time
 from io import BytesIO
 from pathlib import Path
@@ -163,6 +164,9 @@ class LocalLlmClient(object):
                     if text:
                         chunks.append(text)
                         stream_callback(text)
+                        stuck_reason = stream_repetition_reason(chunks)
+                        if stuck_reason:
+                            raise RuntimeError(stuck_reason)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
             if is_vision_preprocess_error(detail):
@@ -194,3 +198,36 @@ def is_vision_preprocess_error(detail):
         or "Qwen2VLProcessor" in detail
         or ("Failed to apply" in detail and "images" in detail)
     )
+
+
+def stream_repetition_reason(chunks):
+    text = "".join(chunks)
+    if len(text) < 512:
+        return ""
+    tail = text[-1024:]
+    compact = re.sub(r"\s+", "", tail)
+    if len(compact) < 128:
+        return ""
+    common_bad_units = ("/n", "\\n", "/N", "\\N")
+    for unit in common_bad_units:
+        if compact == unit * (len(compact) // len(unit)):
+            return (
+                "LLM stream appears stuck repeating low-information output ({0}); "
+                "aborting this request so it can be retried.".format(unit)
+            )
+    if len(set(compact)) <= 3 and is_repeated_unit(compact):
+        return (
+            "LLM stream appears stuck repeating low-information output; "
+            "aborting this request so it can be retried."
+        )
+    return ""
+
+
+def is_repeated_unit(text):
+    for size in range(1, 9):
+        if len(text) % size:
+            continue
+        unit = text[:size]
+        if unit and text == unit * (len(text) // size):
+            return True
+    return False
