@@ -1784,6 +1784,7 @@ def choose_cover_page(
     count = max(1, min(int(settings.get("cover_scan_pages", 5)), len(image_paths)))
     candidates = image_paths[:count]
     attempt = 1
+    multi_image_failure = ""
     client = LocalLlmClient(
         settings.get("base_url"),
         model=settings.get("model"),
@@ -1812,7 +1813,8 @@ def choose_cover_page(
                 if cancel_callback and cancel_callback():
                     raise RuntimeError("Canceled by user")
                 if is_fatal_vision_preprocess_error(message):
-                    raise
+                    multi_image_failure = message.splitlines()[0]
+                    break
                 if "400" not in message and "BadRequestError" not in message:
                     if retry_callback is None:
                         return 1, "Cover detection response was not JSON"
@@ -1824,6 +1826,10 @@ def choose_cover_page(
     best_page = 1
     best_score = -1.0
     best_reason = "No confident cover detected; using first scanned page."
+    if multi_image_failure:
+        best_reason = "Multi-image cover detection failed; fell back to single-page scoring. {0}".format(
+            multi_image_failure
+        )
     while True:
         if cancel_callback and cancel_callback():
             raise RuntimeError("Canceled by user")
