@@ -78,23 +78,6 @@ COMPACT_PAGE_JSON_PROMPT = """\n\n紧凑 JSON 输出要求：
 """
 
 
-PLAIN_TEXT_RECOVERY_PROMPT = """请重新观察这页扫描图，只转写页面中真实可见的正文文字。
-
-要求：
-1. 只输出纯文本，不要 JSON，不要 Markdown 代码块，不要解释。
-2. 去掉页码、页眉、页脚和装饰线。
-3. 合并同一自然段内的换行，段落之间用一个空行分隔。
-4. 如果上一轮一直输出空白、回车、/n、\\n 或不完整 JSON，请不要延续上一轮输出，必须重新转写图片。
-5. 如果页面确实没有可转写正文，只输出空字符串。
-
-上一轮错误：
-{error}
-
-上一轮输出摘要：
-{response}
-"""
-
-
 def compact_previous_response_for_prompt(value, limit=4000):
     text = str(value or "")
     text = re.sub(r"([ \t\r\n])\1{8,}", r"\1[repeated whitespace omitted]\1", text)
@@ -1633,7 +1616,95 @@ def model_finish_reason(raw_response):
 
 def page_max_tokens(settings):
     configured = int(settings.get("max_tokens_per_page", 65536) or 65536)
-    return max(65536, configured)
+    return max(512, configured)
+
+
+def page_temperature(settings):
+    try:
+        value = float(settings.get("_page_temperature", 0) or 0)
+    except Exception:
+        value = 0.0
+    return max(0.0, min(0.3, value))
+
+
+def jittered_retry_image(image_path, page_number, retry_index):
+    try:
+        from PIL import Image
+    except Exception:
+        return image_path, None
+    source = Path(image_path)
+    try:
+        image = Image.open(str(source)).convert("RGB")
+    except Exception:
+        return image_path, None
+    width, height = image.size
+    if width < 64 or height < 64:
+        return image_path, None
+    seed = zlib.crc32(("{0}:{1}:{2}".format(source, page_number, retry_index)).encode("utf-8"))
+    left = 1 + (seed % 4)
+    top = 1 + ((seed >> 4) % 4)
+    right = 1 + ((seed >> 8) % 4)
+    bottom = 1 + ((seed >> 12) % 4)
+    if width - left - right < 32 or height - top - bottom < 32:
+        return image_path, None
+    output = source.with_name(
+        "{0}.retry_{1}_{2}_{3}_{4}_{5}{6}".format(
+            source.stem,
+            int(retry_index),
+            left,
+            top,
+            right,
+            bottom,
+            ".jpg",
+        )
+    )
+    try:
+        image.crop((left, top, width - right, height - bottom)).save(str(output), format="JPEG", quality=92)
+    except Exception:
+        return image_path, None
+    return output, {"path": str(output), "crop_px": [left, top, right, bottom]}
+
+
+class OcrRequestCoordinator(object):
+    def __init__(self, max_workers):
+        self.enabled = int(max_workers or 1) > 1
+        self.condition = threading.Condition()
+        self.active_shared = 0
+        self.exclusive_waiting = 0
+        self.exclusive_active = False
+
+    def run_shared(self, callback):
+        if not self.enabled:
+            return callback()
+        with self.condition:
+            while self.exclusive_waiting or self.exclusive_active:
+                self.condition.wait(0.2)
+            self.active_shared += 1
+        try:
+            return callback()
+        finally:
+            with self.condition:
+                self.active_shared -= 1
+                self.condition.notify_all()
+
+    def run_exclusive(self, callback):
+        if not self.enabled:
+            return callback()
+        with self.condition:
+            self.exclusive_waiting += 1
+            try:
+                while self.exclusive_active or self.active_shared:
+                    self.condition.wait(0.2)
+                self.exclusive_active = True
+            finally:
+                self.exclusive_waiting -= 1
+                self.condition.notify_all()
+        try:
+            return callback()
+        finally:
+            with self.condition:
+                self.exclusive_active = False
+                self.condition.notify_all()
 
 
 def ocr_page(page_number, image_path, settings, stream_callback=None, cancel_callback=None):
@@ -1655,7 +1726,7 @@ def ocr_page(page_number, image_path, settings, stream_callback=None, cancel_cal
         build_page_prompt(settings),
         [image_path],
         max_tokens=page_max_tokens(settings),
-        temperature=0,
+        temperature=page_temperature(settings),
         stream_callback=on_delta,
         cancel_callback=cancel_callback,
     )
@@ -1671,67 +1742,6 @@ def ocr_page(page_number, image_path, settings, stream_callback=None, cancel_cal
     )
 
 
-def ocr_page_plain_text_recovery(
-    page_number,
-    image_path,
-    settings,
-    error_message,
-    previous_response,
-    stream_callback=None,
-    cancel_callback=None,
-):
-    client = LocalLlmClient(
-        settings.get("base_url"),
-        model=settings.get("model"),
-        timeout=int(settings.get("request_timeout", 180)),
-        max_image_side=vision_max_image_side(settings),
-    )
-    chunks = []
-
-    def on_delta(delta):
-        chunks.append(delta)
-        if stream_callback:
-            stream_callback(page_number, delta)
-
-    started = time.time()
-    prompt = PLAIN_TEXT_RECOVERY_PROMPT.format(
-        error=str(error_message or "")[:2400],
-        response=compact_previous_response_for_prompt(previous_response, 3000),
-    )
-    result = client.vision_chat(
-        prompt,
-        [image_path],
-        max_tokens=min(page_max_tokens(settings), 16384),
-        temperature=0,
-        stream_callback=on_delta,
-        cancel_callback=cancel_callback,
-    )
-    text = cleanup_ocr_text(result.get("text") or "".join(chunks))
-    text = re.sub(r"^```(?:text)?\s*", "", text).strip()
-    text = re.sub(r"\s*```$", "", text).strip()
-    if not text:
-        raise RuntimeError("Plain-text OCR recovery returned no usable text.")
-    return {
-        "page": int(page_number),
-        "image_path": str(image_path),
-        "text": text,
-        "blocks": [],
-        "page_continues_previous": False,
-        "page_role": "body",
-        "title": "",
-        "has_illustrations": False,
-        "illustrations": [],
-        "notes": [],
-        "usage": result.get("usage") or {},
-        "seconds": result.get("seconds") or (time.time() - started),
-        "raw": {
-            "_plain_text_recovery": True,
-            "response_text": result.get("text") or "".join(chunks),
-            "raw_response": result.get("raw") or {},
-        },
-    }
-
-
 def ocr_page_with_retry(
     page_number,
     image_path,
@@ -1739,6 +1749,7 @@ def ocr_page_with_retry(
     stream_callback=None,
     cancel_callback=None,
     retry_callback=None,
+    request_coordinator=None,
 ):
     attempt = 1
     previous_invalid_response = None
@@ -1747,15 +1758,40 @@ def ocr_page_with_retry(
     retry_error_message = ""
     retry_response_text = ""
     stream_repetition_count = 0
+    exclusive_retry = False
+    jitter_retry_index = 0
+    retry_temperature = 0.0
     while True:
         if cancel_callback and cancel_callback():
             raise RuntimeError("Canceled by user")
         try:
             attempt_settings = dict(settings or {})
+            if retry_temperature:
+                attempt_settings["_page_temperature"] = retry_temperature
             if attempt > 1:
                 attempt_settings["_page_retry_error"] = retry_error_message
                 attempt_settings["_page_retry_response"] = retry_response_text
-            return ocr_page(page_number, image_path, attempt_settings, stream_callback, cancel_callback)
+            attempt_image_path = image_path
+            jitter_info = None
+            if jitter_retry_index:
+                attempt_image_path, jitter_info = jittered_retry_image(image_path, page_number, jitter_retry_index)
+
+            def run_request():
+                result = ocr_page(page_number, attempt_image_path, attempt_settings, stream_callback, cancel_callback)
+                if jitter_info:
+                    result["image_path"] = str(image_path)
+                    raw = result.get("raw") if isinstance(result.get("raw"), dict) else {}
+                    raw["_image_jitter_retry"] = jitter_info
+                    result["raw"] = raw
+                return result
+
+            use_exclusive = exclusive_retry
+            exclusive_retry = False
+            if request_coordinator is not None:
+                if use_exclusive:
+                    return request_coordinator.run_exclusive(run_request)
+                return request_coordinator.run_shared(run_request)
+            return run_request()
         except InvalidJsonResponseError as exc:
             if cancel_callback and cancel_callback():
                 raise RuntimeError("Canceled by user")
@@ -1810,25 +1846,14 @@ def ocr_page_with_retry(
             if cancel_callback and cancel_callback():
                 raise RuntimeError("Canceled by user")
             stream_repetition_count += 1
-            retry_error_message = str(exc)
-            retry_response_text = str(exc.response_text or "").strip()
-            if stream_repetition_count >= 2:
-                try:
-                    return ocr_page_plain_text_recovery(
-                        page_number,
-                        image_path,
-                        settings,
-                        retry_error_message,
-                        retry_response_text,
-                        stream_callback=stream_callback,
-                        cancel_callback=cancel_callback,
-                    )
-                except Exception as recovery_exc:
-                    retry_error_message = "{0}\nPlain-text recovery failed: {1}".format(
-                        retry_error_message,
-                        recovery_exc,
-                    )
-                    retry_response_text = compact_previous_response_for_prompt(retry_response_text, 3000)
+            # Repeated whitespace or repeated "\n" is a decoding failure, not a
+            # malformed JSON draft. Do not feed the bad stream back into the next
+            # prompt; a clean retry is much more likely to escape the loop.
+            retry_error_message = ""
+            retry_response_text = ""
+            exclusive_retry = request_coordinator is not None and request_coordinator.enabled
+            jitter_retry_index = stream_repetition_count
+            retry_temperature = 0.1 if stream_repetition_count >= 3 else 0.0
             if retry_callback is None:
                 raise
             decision = retry_callback(page_number, attempt, str(exc))
@@ -1884,6 +1909,7 @@ def ocr_page_items(
 ):
     max_workers = max(1, int(settings.get("parallel_pages", 2)))
     results = {}
+    request_coordinator = OcrRequestCoordinator(max_workers)
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         pending = {}
         remaining = iter(page_items)
@@ -1905,6 +1931,7 @@ def ocr_page_items(
                 page_delta,
                 cancel_callback,
                 retry_callback,
+                request_coordinator,
             )
             pending[future] = index
             return True
