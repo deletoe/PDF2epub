@@ -11,7 +11,7 @@ import zlib
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from calibre_plugins.local_pdf_ocr.local_llm import LocalLlmClient
+from calibre_plugins.local_pdf_ocr.local_llm import LocalLlmClient, StreamRepetitionError
 
 
 class InvalidJsonResponseError(RuntimeError):
@@ -26,12 +26,12 @@ PAGE_PROMPT = """请把这页中文扫描书页转写为可重排电子书文本
 要求：
 1. 只输出页面中真实可见的文字，不要补写下一页或推测缺失内容。
 1a. 如果页末是未完句、跨页断词或未完引文，按原页可见文字停住；不要为了句子完整而补标点、补字或补闭引号。
-1b. 即使页面只有一个月份、章节题名、页签或极少量文字，也必须输出这些可见文字；不要返回空对象 {}。真正空白页也必须按 schema 返回 page_role="blank"、text=""、blocks=[]。污迹、透印、扫描噪点或无法清楚辨认的残字不要猜测或补写。
+1b. 即使页面只有一个月份、章节题名、页签或极少量文字，也必须输出这些可见文字；不要返回空对象 {}。真正空白页也必须按 schema 返回 page_role="blank"、text=""、blocks=[]。如果页面只有插图、照片、地图、表格、手稿图等，没有可转写正文，也必须返回合法 JSON：text=""、blocks=[]、page_role="illustration" 或合适角色、has_illustrations=true，并在 illustrations 中给出图片范围。污迹、透印、扫描噪点或无法清楚辨认的残字不要猜测或补写。
 2. 去掉页码、装饰线、页眉、页脚。页眉通常是每页顶部反复出现的书名/章节名/栏目名，例如“阿莱克修斯传”等；除非它也是本页正文中的真实标题，否则不要放入正文。
 3. 合并同一自然段内的换行；对话另起段。
 4. 使用中文标点。不要改写原文。
 5. 不要在中文、数字、英文、标点之间额外添加空格；标题里的装饰性字间距要还原，例如“译 者 序”应输出为“译者序”，“1131 年”应输出为“1131年”。
-6. text 字段必须包含本页完整可重排正文，标题用 Markdown #/##/### 标出。blocks 字段只标注标题、引文、带注释锚点的段落、跨页续接的首段等结构信息；普通正文段落不要在 blocks 中重复一遍。
+6. text 字段必须包含本页完整可重排正文，标题用 Markdown #/##/### 标出。只有当本页确实没有可转写正文、只有插图/照片/图表时，text 才可以为空。blocks 字段只标注标题、引文、带注释锚点的段落、跨页续接的首段等结构信息；普通正文段落不要在 blocks 中重复一遍。
 7. 如果本页第一段不是新段落，而是承接上一页最后一段，请把 page_continues_previous 设为 true，并把第一个正文 paragraph block 的 continued_from_previous 设为 true。
 8. 如果页面边角或页边有角注、脚注、校注、译注等，不要混进正文；放入 notes，并在相关 block 中用 note_markers 标出锚点。无法确定锚点时 anchor 留空。
 9. 如果页面包含插图、照片、地图、表格、手稿图等非纯装饰图片，在 illustrations 中给出裁切范围。
@@ -78,12 +78,31 @@ COMPACT_PAGE_JSON_PROMPT = """\n\n紧凑 JSON 输出要求：
 """
 
 
+def build_page_retry_prompt(error_message, previous_response):
+    return (
+        "\n\n上一次 OCR 尝试失败了。请重新观察图片并修正你的输出，仍然只返回一个完整 JSON 对象，不要 Markdown 代码块，不要解释。\n"
+        "不要延续上一次错误输出；如果上一次一直输出 /n、\\n、重复符号或不完整 JSON，那是无效结果，请完全重新生成。\n"
+        "如果上一次 JSON 中已经能看到正文、注释或 illustrations，请尽量保留这些可见信息，但修正 schema、引号、逗号、page_role、has_illustrations 和 bbox。\n"
+        "如果页面只有图片没有正文，这不是错误：返回 text=\"\"、blocks=[]、page_role=\"illustration\" 或合适角色、has_illustrations=true、illustrations=[...]。\n\n"
+        "上一次错误：\n{error}\n\n"
+        "上一次原始输出：\n{response}\n"
+    ).format(
+        error=str(error_message or "")[:2400],
+        response=str(previous_response or "")[:12000],
+    )
+
+
 def build_page_prompt(settings):
     prompt = PAGE_PROMPT
     if settings and settings.get("convert_traditional_to_simplified", False):
         prompt += SIMPLIFIED_OUTPUT_PROMPT
     if not settings or not settings.get("_disable_compact_page_json"):
         prompt += COMPACT_PAGE_JSON_PROMPT
+    if settings and (settings.get("_page_retry_error") or settings.get("_page_retry_response")):
+        prompt += build_page_retry_prompt(
+            settings.get("_page_retry_error") or "",
+            settings.get("_page_retry_response") or "",
+        )
     return prompt
 
 
@@ -649,6 +668,13 @@ def vision_max_image_side(settings):
         return int((settings or {}).get("vision_max_image_side", 2400) or 0)
     except Exception:
         return 2400
+
+
+def cover_vision_max_image_side(settings):
+    try:
+        return int((settings or {}).get("cover_vision_max_image_side", 1200) or 0)
+    except Exception:
+        return 1200
 
 
 def is_fatal_vision_preprocess_error(error):
@@ -1445,7 +1471,8 @@ def build_page_json_correction_prompt(error_message, previous_response):
         '"notes":[]'
         "}}\n\n"
         "如果上一次返回里能看到 text 字段，请保留其中的正文。"
-        "如果无法恢复正文且页面确实表示为空白，返回 page_role=\"blank\"、text=\"\"、blocks=[]。"
+        "如果上一次返回里能看到 illustrations，即使 text 为空也要保留图片信息，并修正为 page_role=\"illustration\" 或合适角色、has_illustrations=true。"
+        "如果无法恢复正文且页面确实表示为空白，返回 page_role=\"blank\"、text=\"\"、blocks=[]、has_illustrations=false、illustrations=[]。"
         "不要把错误信息写进正文。\n\n"
         "JSON 解析/校验错误：\n{error}\n\n"
         "上一次原始返回：\n{response}"
@@ -1527,12 +1554,6 @@ def normalize_page_result(page_number, image_path, response_text, usage=None, se
     blocks = normalize_blocks(data, text)
     if not text and blocks:
         text = blocks_to_markdown(blocks)
-    if not text.strip() and str(data.get("page_role") or "") not in ("blank", "cover"):
-        raise InvalidJsonResponseError(
-            "Model response JSON did not contain usable OCR text.",
-            response_text=response_text,
-            raw_response=raw_response,
-        )
     illustrations = []
     for item in data.get("illustrations") or []:
         bbox = item.get("bbox") or []
@@ -1549,13 +1570,20 @@ def normalize_page_result(page_number, image_path, response_text, usage=None, se
                 "insert_after": str(item.get("insert_after") or "").strip(),
             }
         )
+    page_role = str(data.get("page_role") or "unknown")
+    if not text.strip() and not illustrations and page_role not in ("blank", "cover", "copyright"):
+        raise InvalidJsonResponseError(
+            "Model response JSON did not contain usable OCR text or illustration data.",
+            response_text=response_text,
+            raw_response=raw_response,
+        )
     result = {
         "page": int(page_number),
         "image_path": str(image_path),
         "text": text,
         "blocks": blocks,
         "page_continues_previous": normalize_bool(data.get("page_continues_previous")),
-        "page_role": str(data.get("page_role") or "unknown"),
+        "page_role": page_role,
         "title": str(data.get("title") or "").strip(),
         "has_illustrations": bool(data.get("has_illustrations") or illustrations),
         "illustrations": illustrations,
@@ -1626,19 +1654,23 @@ def ocr_page_with_retry(
     previous_invalid_response = None
     correction_failed_responses = set()
     backup_failed_responses = set()
+    retry_error_message = ""
+    retry_response_text = ""
     while True:
         if cancel_callback and cancel_callback():
             raise RuntimeError("Canceled by user")
         try:
             attempt_settings = dict(settings or {})
             if attempt > 1:
-                attempt_settings["_compact_page_json"] = True
+                attempt_settings["_page_retry_error"] = retry_error_message
+                attempt_settings["_page_retry_response"] = retry_response_text
             return ocr_page(page_number, image_path, attempt_settings, stream_callback, cancel_callback)
         except InvalidJsonResponseError as exc:
             if cancel_callback and cancel_callback():
                 raise RuntimeError("Canceled by user")
             response_key = str(exc.response_text or "").strip()
             finish_reason = model_finish_reason(exc.raw_response)
+            correction_error = ""
             if (
                 response_key
                 and response_key not in correction_failed_responses
@@ -1646,8 +1678,10 @@ def ocr_page_with_retry(
             ):
                 try:
                     return correct_page_json_response(page_number, image_path, settings, exc, cancel_callback)
-                except Exception:
+                except Exception as correction_exc:
+                    correction_error = str(correction_exc)
                     correction_failed_responses.add(response_key)
+            backup_error = ""
             if (
                 response_key
                 and previous_invalid_response == response_key
@@ -1663,9 +1697,28 @@ def ocr_page_with_retry(
                         seconds=None,
                         raw_response=exc.raw_response,
                     )
-                except InvalidJsonResponseError:
+                except InvalidJsonResponseError as backup_exc:
+                    backup_error = str(backup_exc)
                     backup_failed_responses.add(response_key)
             previous_invalid_response = response_key
+            retry_error_parts = [str(exc)]
+            if correction_error:
+                retry_error_parts.append("Automatic JSON correction failed: {0}".format(correction_error))
+            if backup_error:
+                retry_error_parts.append("Partial-response backup failed: {0}".format(backup_error))
+            retry_error_message = "\n".join(retry_error_parts)
+            retry_response_text = response_key
+            if retry_callback is None:
+                raise
+            decision = retry_callback(page_number, attempt, str(exc))
+            if decision == "abandon":
+                raise RuntimeError("Abandoned by user")
+            attempt += 1
+        except StreamRepetitionError as exc:
+            if cancel_callback and cancel_callback():
+                raise RuntimeError("Canceled by user")
+            retry_error_message = str(exc)
+            retry_response_text = str(exc.response_text or "").strip()
             if retry_callback is None:
                 raise
             decision = retry_callback(page_number, attempt, str(exc))
@@ -1677,6 +1730,8 @@ def ocr_page_with_retry(
                 raise RuntimeError("Canceled by user")
             if is_fatal_vision_preprocess_error(exc):
                 raise
+            retry_error_message = str(exc)
+            retry_response_text = str(getattr(exc, "response_text", "") or "").strip()
             if retry_callback is None:
                 raise
             decision = retry_callback(page_number, attempt, str(exc))
@@ -1789,7 +1844,7 @@ def choose_cover_page(
         settings.get("base_url"),
         model=settings.get("model"),
         timeout=int(settings.get("request_timeout", 180)),
-        max_image_side=vision_max_image_side(settings),
+        max_image_side=cover_vision_max_image_side(settings),
     )
     if count > 1 and settings.get("cover_multi_image", False):
         while True:

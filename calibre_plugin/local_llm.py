@@ -20,6 +20,13 @@ except ImportError:  # pragma: no cover - Python 2 compatibility for old Calibre
     from urllib2 import HTTPError, Request, URLError, urlopen
 
 
+class StreamRepetitionError(RuntimeError):
+    def __init__(self, message, response_text="", raw_response=None):
+        RuntimeError.__init__(self, message)
+        self.response_text = response_text or ""
+        self.raw_response = raw_response or {}
+
+
 def normalize_base_url(base_url):
     base_url = str(base_url or "").strip().rstrip("/")
     if not base_url:
@@ -166,7 +173,11 @@ class LocalLlmClient(object):
                         stream_callback(text)
                         stuck_reason = stream_repetition_reason(chunks)
                         if stuck_reason:
-                            raise RuntimeError(stuck_reason)
+                            raise StreamRepetitionError(
+                                stuck_reason,
+                                response_text="".join(chunks),
+                                raw_response={"choices": [{"finish_reason": "repetition"}]},
+                            )
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
             if is_vision_preprocess_error(detail):
@@ -205,16 +216,30 @@ def stream_repetition_reason(chunks):
     if len(text) < 512:
         return ""
     tail = text[-1024:]
+    if len(tail) >= 512 and not tail.strip():
+        return (
+            "LLM stream appears stuck repeating whitespace; "
+            "aborting this request so it can be retried."
+        )
     compact = re.sub(r"\s+", "", tail)
     if len(compact) < 128:
         return ""
     common_bad_units = ("/n", "\\n", "/N", "\\N")
-    for unit in common_bad_units:
-        if compact == unit * (len(compact) // len(unit)):
-            return (
-                "LLM stream appears stuck repeating low-information output ({0}); "
-                "aborting this request so it can be retried.".format(unit)
-            )
+    punctuation_stripped = re.sub(r"""["'`,，,\[\]\{\}:：]+""", "", compact)
+    for candidate in (compact, punctuation_stripped):
+        if len(candidate) < 128:
+            continue
+        for unit in common_bad_units:
+            if candidate == unit * (len(candidate) // len(unit)):
+                return (
+                    "LLM stream appears stuck repeating low-information output ({0}); "
+                    "aborting this request so it can be retried.".format(unit)
+                )
+    if len(set(punctuation_stripped)) <= 3 and is_repeated_unit(punctuation_stripped):
+        return (
+            "LLM stream appears stuck repeating low-information output; "
+            "aborting this request so it can be retried."
+        )
     if len(set(compact)) <= 3 and is_repeated_unit(compact):
         return (
             "LLM stream appears stuck repeating low-information output; "
