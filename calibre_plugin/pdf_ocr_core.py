@@ -78,17 +78,46 @@ COMPACT_PAGE_JSON_PROMPT = """\n\n紧凑 JSON 输出要求：
 """
 
 
+PLAIN_TEXT_RECOVERY_PROMPT = """请重新观察这页扫描图，只转写页面中真实可见的正文文字。
+
+要求：
+1. 只输出纯文本，不要 JSON，不要 Markdown 代码块，不要解释。
+2. 去掉页码、页眉、页脚和装饰线。
+3. 合并同一自然段内的换行，段落之间用一个空行分隔。
+4. 如果上一轮一直输出空白、回车、/n、\\n 或不完整 JSON，请不要延续上一轮输出，必须重新转写图片。
+5. 如果页面确实没有可转写正文，只输出空字符串。
+
+上一轮错误：
+{error}
+
+上一轮输出摘要：
+{response}
+"""
+
+
+def compact_previous_response_for_prompt(value, limit=4000):
+    text = str(value or "")
+    text = re.sub(r"([ \t\r\n])\1{8,}", r"\1[repeated whitespace omitted]\1", text)
+    text = re.sub(r"((?:/n|\\n)[\"'`,，,\s]*){8,}", "[repeated /n output omitted]", text)
+    if len(text) <= limit:
+        return text
+    head = text[: limit // 2]
+    tail = text[-limit // 2 :]
+    return head + "\n...[previous response truncated]...\n" + tail
+
+
 def build_page_retry_prompt(error_message, previous_response):
     return (
         "\n\n上一次 OCR 尝试失败了。请重新观察图片并修正你的输出，仍然只返回一个完整 JSON 对象，不要 Markdown 代码块，不要解释。\n"
         "不要延续上一次错误输出；如果上一次一直输出 /n、\\n、重复符号或不完整 JSON，那是无效结果，请完全重新生成。\n"
+        "这一次必须返回单行压缩 JSON：不要使用 ```json 代码块，不要漂亮打印，不要在 JSON 字符串中输出真实换行；段落换行必须写成转义的 \\n\\n。\n"
         "如果上一次 JSON 中已经能看到正文、注释或 illustrations，请尽量保留这些可见信息，但修正 schema、引号、逗号、page_role、has_illustrations 和 bbox。\n"
         "如果页面只有图片没有正文，这不是错误：返回 text=\"\"、blocks=[]、page_role=\"illustration\" 或合适角色、has_illustrations=true、illustrations=[...]。\n\n"
         "上一次错误：\n{error}\n\n"
         "上一次原始输出：\n{response}\n"
     ).format(
         error=str(error_message or "")[:2400],
-        response=str(previous_response or "")[:12000],
+        response=compact_previous_response_for_prompt(previous_response, 4000),
     )
 
 
@@ -1642,6 +1671,67 @@ def ocr_page(page_number, image_path, settings, stream_callback=None, cancel_cal
     )
 
 
+def ocr_page_plain_text_recovery(
+    page_number,
+    image_path,
+    settings,
+    error_message,
+    previous_response,
+    stream_callback=None,
+    cancel_callback=None,
+):
+    client = LocalLlmClient(
+        settings.get("base_url"),
+        model=settings.get("model"),
+        timeout=int(settings.get("request_timeout", 180)),
+        max_image_side=vision_max_image_side(settings),
+    )
+    chunks = []
+
+    def on_delta(delta):
+        chunks.append(delta)
+        if stream_callback:
+            stream_callback(page_number, delta)
+
+    started = time.time()
+    prompt = PLAIN_TEXT_RECOVERY_PROMPT.format(
+        error=str(error_message or "")[:2400],
+        response=compact_previous_response_for_prompt(previous_response, 3000),
+    )
+    result = client.vision_chat(
+        prompt,
+        [image_path],
+        max_tokens=min(page_max_tokens(settings), 16384),
+        temperature=0,
+        stream_callback=on_delta,
+        cancel_callback=cancel_callback,
+    )
+    text = cleanup_ocr_text(result.get("text") or "".join(chunks))
+    text = re.sub(r"^```(?:text)?\s*", "", text).strip()
+    text = re.sub(r"\s*```$", "", text).strip()
+    if not text:
+        raise RuntimeError("Plain-text OCR recovery returned no usable text.")
+    return {
+        "page": int(page_number),
+        "image_path": str(image_path),
+        "text": text,
+        "blocks": [],
+        "page_continues_previous": False,
+        "page_role": "body",
+        "title": "",
+        "has_illustrations": False,
+        "illustrations": [],
+        "notes": [],
+        "usage": result.get("usage") or {},
+        "seconds": result.get("seconds") or (time.time() - started),
+        "raw": {
+            "_plain_text_recovery": True,
+            "response_text": result.get("text") or "".join(chunks),
+            "raw_response": result.get("raw") or {},
+        },
+    }
+
+
 def ocr_page_with_retry(
     page_number,
     image_path,
@@ -1656,6 +1746,7 @@ def ocr_page_with_retry(
     backup_failed_responses = set()
     retry_error_message = ""
     retry_response_text = ""
+    stream_repetition_count = 0
     while True:
         if cancel_callback and cancel_callback():
             raise RuntimeError("Canceled by user")
@@ -1668,6 +1759,7 @@ def ocr_page_with_retry(
         except InvalidJsonResponseError as exc:
             if cancel_callback and cancel_callback():
                 raise RuntimeError("Canceled by user")
+            stream_repetition_count = 0
             response_key = str(exc.response_text or "").strip()
             finish_reason = model_finish_reason(exc.raw_response)
             correction_error = ""
@@ -1717,8 +1809,26 @@ def ocr_page_with_retry(
         except StreamRepetitionError as exc:
             if cancel_callback and cancel_callback():
                 raise RuntimeError("Canceled by user")
+            stream_repetition_count += 1
             retry_error_message = str(exc)
             retry_response_text = str(exc.response_text or "").strip()
+            if stream_repetition_count >= 2:
+                try:
+                    return ocr_page_plain_text_recovery(
+                        page_number,
+                        image_path,
+                        settings,
+                        retry_error_message,
+                        retry_response_text,
+                        stream_callback=stream_callback,
+                        cancel_callback=cancel_callback,
+                    )
+                except Exception as recovery_exc:
+                    retry_error_message = "{0}\nPlain-text recovery failed: {1}".format(
+                        retry_error_message,
+                        recovery_exc,
+                    )
+                    retry_response_text = compact_previous_response_for_prompt(retry_response_text, 3000)
             if retry_callback is None:
                 raise
             decision = retry_callback(page_number, attempt, str(exc))

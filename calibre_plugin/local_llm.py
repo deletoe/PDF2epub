@@ -170,7 +170,6 @@ class LocalLlmClient(object):
                     text = delta.get("content") or ""
                     if text:
                         chunks.append(text)
-                        stream_callback(text)
                         stuck_reason = stream_repetition_reason(chunks)
                         if stuck_reason:
                             raise StreamRepetitionError(
@@ -178,6 +177,7 @@ class LocalLlmClient(object):
                                 response_text="".join(chunks),
                                 raw_response={"choices": [{"finish_reason": "repetition"}]},
                             )
+                        stream_callback(text)
         except HTTPError as exc:
             detail = exc.read().decode("utf-8", "replace")
             if is_vision_preprocess_error(detail):
@@ -213,10 +213,17 @@ def is_vision_preprocess_error(detail):
 
 def stream_repetition_reason(chunks):
     text = "".join(chunks)
-    if len(text) < 512:
+    if not text:
         return ""
     tail = text[-1024:]
-    if len(tail) >= 512 and not tail.strip():
+    if len(text) >= 64 and not text.strip():
+        return (
+            "LLM stream appears stuck repeating whitespace; "
+            "aborting this request so it can be retried."
+        )
+    if len(text) < 256:
+        return ""
+    if len(tail) >= 128 and not tail.strip():
         return (
             "LLM stream appears stuck repeating whitespace; "
             "aborting this request so it can be retried."
